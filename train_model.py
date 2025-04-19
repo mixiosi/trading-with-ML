@@ -207,37 +207,51 @@ def calculate_features(df, index_features=None, market_open_hour=9, market_open_
     # ---> REMOVED FINAL DROPNA <---
     return df
 
-# --- Signal Generation Function (MODIFIED: Example refinement) ---
+# --- Signal Generation Function (MODIFIED: Combined Filters) ---
 def generate_entry_signals(df):
     """
-    Identifies potential entry signals.
-    EXAMPLE: Disabled RSI/Stoch Fade signals (4 & 6). ADJUST BASED ON SHAP.
+    Identifies potential entry signals based ONLY on Bollinger Band Mean Reversion,
+    applying time, relative strength, and volume filters.
     """
-    signals = pd.Series(0, index=df.index, dtype=int)
-    req_cols = ['macd', 'macd_signal', 'rsi', 'stoch_k', 'close', 'lower_band', 'upper_band', 'volume_z']
+    signals = pd.Series(0, index=df.index, dtype=int) # Default 0 = no signal
+
+    # Ensure necessary columns exist for BB, Time, Relative RSI, Volume Z
+    req_cols = ['close', 'lower_band', 'upper_band', 'volume_z',
+                'minutes_since_open', 'rel_rsi'] # Added rel_rsi
     if not all(col in df.columns for col in req_cols):
-        print(f"[WARN generate_entry_signals] Missing required columns. Returning no signals.")
+        print(f"[WARN generate_entry_signals] Missing required columns for filtered BB signals: {[c for c in req_cols if c not in df.columns]}. Returning no signals.")
         return signals
 
-    macd_hist = df['macd'].sub(df['macd_signal'], fill_value=0)
-    macd_cross_bull = (macd_hist > 0) & (macd_hist.shift(1).fillna(0) <= 0)
-    macd_cross_bear = (macd_hist < 0) & (macd_hist.shift(1).fillna(0) >= 0)
-    rsi_cross_above_os = (df['rsi'] > RSI_OVERSOLD) & (df['rsi'].shift(1).fillna(RSI_OVERSOLD) <= RSI_OVERSOLD)
-    # rsi_cross_below_ob = (df['rsi'] < RSI_OVERBOUGHT) & (df['rsi'].shift(1).fillna(RSI_OVERBOUGHT) >= RSI_OVERBOUGHT) # Disabled
-    stoch_cross_above_os = (df['stoch_k'] > STOCH_OVERSOLD) & (df['stoch_k'].shift(1).fillna(STOCH_OVERSOLD) <= STOCH_OVERSOLD)
-    # stoch_cross_below_ob = (df['stoch_k'] < STOCH_OVERBOUGHT) & (df['stoch_k'].shift(1).fillna(STOCH_OVERBOUGHT) >= STOCH_OVERBOUGHT) # Disabled
-    bb_rev_long = (df['close'] < df['lower_band']) & (df['volume_z'].fillna(0) > VOLUME_Z_THRESH)
-    bb_rev_short = (df['close'] > df['upper_band']) & (df['volume_z'].fillna(0) < -VOLUME_Z_THRESH)
+    # --- Define Filters based on SHAP Analysis ---
+    # 1. Time Filter: Avoid first hour
+    time_filter = (df['minutes_since_open'] > 50)
 
-    # Assign signal types
-    signals.loc[macd_cross_bull & (df['rsi'].fillna(RSI_MID) > RSI_MID)] = 1
-    signals.loc[macd_cross_bear & (df['rsi'].fillna(RSI_MID) < RSI_MID)] = 2
-    signals.loc[rsi_cross_above_os] = 3
-    # signals.loc[rsi_cross_below_ob] = 4 # Disabled
-    signals.loc[stoch_cross_above_os] = 5
-    # signals.loc[stoch_cross_below_ob] = 6 # Disabled
-    signals.loc[bb_rev_long] = 7
-    signals.loc[bb_rev_short] = 8
+    # 2. Relative Strength Filter (Example: Require positive relative RSI for longs, negative for shorts)
+    #    Adjust threshold based on dependence plot if needed (e.g., rel_rsi > 5)
+    rel_rsi_long_filter = (df['rel_rsi'].fillna(0) > 0)  # Stock stronger than SPY
+    rel_rsi_short_filter = (df['rel_rsi'].fillna(0) < 0) # Stock weaker than SPY
+
+    # 3. Volume Filter (Example: Avoid very low volume signals, require positive Z for longs?)
+    #    Adjust thresholds based on dependence plot. Let's require non-negative Z for this example.
+    volume_filter_long = (df['volume_z'].fillna(0) >= 0) # Avoid very low volume fades for longs
+    volume_filter_short = (df['volume_z'].fillna(0) >= 0) # Maybe avoid low vol breakouts for shorts too? Or remove this filter for shorts? Test variations.
+    # Alternative: volume_filter = (df['volume_z'].fillna(0) > -0.5) # Avoid extremely low volume
+
+    # Combine all filters
+    long_filters_combined = time_filter & rel_rsi_long_filter & volume_filter_long
+    short_filters_combined = time_filter & rel_rsi_short_filter & volume_filter_short
+
+
+    # --- Calculate Bollinger Band Reversion Signals ---
+    bb_rev_long = (df['close'] < df['lower_band'])
+    bb_rev_short = (df['close'] > df['upper_band'])
+
+    # --- Assign ONLY signal types 7 and 8 IF they pass ALL combined filters ---
+    signals.loc[bb_rev_long & long_filters_combined] = 7
+    signals.loc[bb_rev_short & short_filters_combined] = 8
+
+    # Optional: Print counts for debugging
+    print(f"{datetime.now()} - [INFO generate_entry_signals] BB Signal counts (after ALL filters):\n{signals[signals > 0].value_counts()}")
 
     return signals
 
