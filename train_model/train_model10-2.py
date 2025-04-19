@@ -1,0 +1,707 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import talib
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression # Added for baseline
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV, GridSearchCV # Using RandomizedSearch for speed
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix # Added confusion matrix
+import joblib
+import os
+import pandas.api.types
+import traceback
+from datetime import datetime
+import shap # Added for feature importance analysis
+# Optional: Install matplotlib if you want to save SHAP plots
+try:
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_INSTALLED = True
+except ImportError:
+    MATPLOTLIB_INSTALLED = False
+
+# --- Configuration ---
+SYMBOLS = ['AAPL', 'AMD', 'GOOGL', 'META', 'MSFT', 'NVDA', 'QQQ', 'SPY', 'TSLA']
+INDEX_SYMBOL = 'SPY'
+DATA_DIR = '.'
+FILENAME_TEMPLATE = '{}_5min_historical_data.csv' # Using 5-min data
+
+# --- Feature Calculation Parameters (5-min bars) ---
+SMA_WINDOW = 20
+ATR_PERIOD = 14
+RSI_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+STOCH_K = 14
+STOCH_D = 3
+STOCH_SMOOTH = 3
+ROC_PERIOD = 10
+LAG_PERIODS = [1, 3, 5]
+VOLUME_SMA_PERIOD = 20 # For volume Z-score baseline
+
+# --- STRATEGY & LABELING PARAMETERS ---
+# Labeling based on TP/SL outcome of defined entry signals
+LOOKAHEAD_BARS_TP_SL = 15 # How many 5-min bars to look ahead for TP/SL (75 mins)
+SL_MULT = 1.5 # Stop Loss ATR multiplier (Tighter SL)
+TP_MULT = 3.0 # Take Profit ATR multiplier (Reasonable Reward/Risk > 1)
+
+# Signal Thresholds (EXAMPLES - TUNE THESE)
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+RSI_MID = 50
+STOCH_OVERSOLD = 20
+STOCH_OVERBOUGHT = 80
+VOLUME_Z_THRESH = 1.0 # Require more significant volume spike (1 std dev)
+
+# --- Data Processing Parameters ---
+MIN_ROWS_PER_SYMBOL = 100 # Min rows for a stock after initial feature calc
+MIN_SIGNAL_ROWS_PER_SYMBOL = 50 # Min labeled signals needed per stock for inclusion
+USE_FEATURE_SCALING = True
+
+# --- Model Training Parameters ---
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+N_CV_SPLITS = 5 # Use fewer splits for potentially faster CV, esp. with RandomizedSearch
+N_RANDOM_SEARCH_ITER = 50 # Number of iterations for RandomizedSearchCV (adjust balance speed/thoroughness)
+
+# XGBoost RandomizedSearch Parameter Distribution
+XGB_PARAM_DIST = {
+    'n_estimators': [100, 200, 300, 400, 500],
+    'max_depth': [3, 4, 5, 6, 7],
+    'learning_rate': [0.01, 0.05, 0.1, 0.15],
+    'subsample': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'colsample_bytree': [0.6, 0.7, 0.8, 0.9, 1.0],
+    'gamma': [0, 0.1, 0.25, 0.5, 1.0],
+}
+
+# Logistic Regression Parameters
+LOGREG_PARAMS = {
+    'C': [0.01, 0.1, 1, 10], # Inverse of regularization strength
+    'penalty': ['l2'],      # Standard L2 regularization
+    'solver': ['liblinear'] # Good solver for L2
+}
+
+# --- Define Feature Columns ---
+# Base features calculated for EACH stock
+base_stock_feature_columns = [
+    'sma', 'std', 'atr', 'rsi', 'macd', 'macd_signal', 'macd_hist', 'volume_z',
+    'rsi_lag1', 'bb_width', 'stoch_k', 'stoch_d', 'roc',
+    'hour_sin', 'hour_cos', 'dayofweek_sin', 'dayofweek_cos',
+    'return_1_lag1', 'return_1_lag3', 'return_1_lag5',
+    'macd_hist_lag1', 'macd_hist_lag3', 'macd_hist_lag5',
+    'stoch_k_lag1', 'stoch_k_lag3', 'stoch_k_lag5',
+    'atr_lag1', 'atr_lag3', 'atr_lag5',
+    'bb_width_lag1', 'bb_width_lag3', 'bb_width_lag5',
+    'return_1',
+    'sma_diff' # Added sma_diff explicitly
+]
+# Index context features (used for relative calc)
+INDEX_CONTEXT_BASE_COLS = ['return_1', 'rsi', 'atr', 'sma_diff', 'volume_z']
+
+# Relative Strength Features (Comparing stock to index)
+RELATIVE_FEATURE_COLS = ['rel_return_1', 'rel_rsi', 'rel_volume_z']
+
+# Combine feature lists for the final model input (Stock + Relative)
+base_feature_columns = base_stock_feature_columns + RELATIVE_FEATURE_COLS
+
+# Signal Type Column (added later, used for OHE)
+SIGNAL_TYPE_COL = 'signal_type'
+
+
+# --- Feature Calculation Function (MODIFIED: No final dropna) ---
+def calculate_features(df, index_features=None):
+    """
+    Calculate technical indicators, time features, lags, and optionally relative features.
+    Args:
+        df (pd.DataFrame): Stock data with OHLCV.
+        index_features (pd.DataFrame, optional): FULL Index data DataFrame with pre-calculated features
+                                                  (must include 'return_1', 'rsi', 'volume_z').
+                                                  Required for relative feature calculation.
+    Returns:
+        pd.DataFrame: DataFrame with calculated features (MAY CONTAIN NaNs at the start).
+    """
+    required_input_cols = ['high', 'low', 'close', 'open', 'volume']
+    if not all(col in df.columns for col in required_input_cols):
+        missing_cols = [col for col in required_input_cols if col not in df.columns]
+        print(f"[ERROR calculate_features] Missing required input columns: {missing_cols}. Returning empty DataFrame.")
+        return pd.DataFrame()
+
+    cols_to_check = ['high', 'low', 'close', 'open', 'volume']
+    for col in cols_to_check:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    df.dropna(subset=required_input_cols, inplace=True) # Drop rows missing essential OHLCV
+    if df.empty: return df
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        print(f"{datetime.now()} - [WARN calculate_features] Index not DatetimeIndex. Attempting conversion.")
+        try:
+            df.index = pd.to_datetime(df.index); df.sort_index(inplace=True)
+            if not isinstance(df.index, pd.DatetimeIndex): raise ValueError("Failed conversion.")
+        except Exception as e:
+            print(f"{datetime.now()} - [ERROR calculate_features] Index conversion failed: {e}. Time/SMA features will be NaN.")
+            for tf in ['hour_sin', 'hour_cos', 'dayofweek_sin', 'dayofweek_cos']: df[tf] = np.nan
+            df['sma_diff'] = np.nan # sma_diff depends on sma which needs index
+            # Also set relative features to NaN if index fails
+            for rf in ['rel_return_1', 'rel_rsi', 'rel_volume_z']: df[rf] = np.nan
+    elif not df.index.is_monotonic_increasing:
+        print(f"{datetime.now()} - [WARN calculate_features] Index not sorted. Sorting.")
+        df.sort_index(inplace=True)
+
+    # Calculate Basic Features
+    df['sma'] = df['close'].rolling(window=SMA_WINDOW, min_periods=SMA_WINDOW // 2).mean()
+    df['std'] = df['close'].rolling(window=SMA_WINDOW, min_periods=SMA_WINDOW // 2).std()
+    df['upper_band'] = df['sma'] + 2 * df['std']
+    df['lower_band'] = df['sma'] - 2 * df['std']
+    df['sma_diff'] = df['close'] - df['sma'] # Calculated after SMA
+
+    # TA-Lib Indicators
+    high_prices=df['high'].values; low_prices=df['low'].values; close_prices=df['close'].values
+    if len(close_prices) >= ATR_PERIOD: df['atr'] = talib.ATR(high_prices, low_prices, close_prices, timeperiod=ATR_PERIOD)
+    else: df['atr'] = np.nan
+    if len(close_prices) >= RSI_PERIOD: df['rsi'] = talib.RSI(close_prices, timeperiod=RSI_PERIOD)
+    else: df['rsi'] = np.nan
+    if len(close_prices) >= MACD_SLOW:
+        macd, macdsignal, macdhist = talib.MACD(close_prices, fastperiod=MACD_FAST, slowperiod=MACD_SLOW, signalperiod=MACD_SIGNAL)
+        df['macd']=macd; df['macd_signal']=macdsignal; df['macd_hist']=macdhist
+    else: df['macd']=np.nan; df['macd_signal']=np.nan; df['macd_hist']=np.nan
+    sma_safe = df['sma'].replace(0, 1e-10)
+    df['bb_width'] = (df['upper_band'] - df['lower_band']) / sma_safe
+    if len(close_prices) >= STOCH_K + STOCH_D - 1 :
+         df['stoch_k'], df['stoch_d'] = talib.STOCH(high_prices, low_prices, close_prices, fastk_period=STOCH_K, slowk_period=STOCH_SMOOTH, slowk_matype=0, slowd_period=STOCH_D, slowd_matype=0)
+    else: df['stoch_k'], df['stoch_d'] = np.nan, np.nan
+    if len(close_prices) >= ROC_PERIOD: df['roc'] = talib.ROC(close_prices, timeperiod=ROC_PERIOD)
+    else: df['roc'] = np.nan
+
+    # Volume Z-Score
+    df['volume_sma'] = df['volume'].rolling(window=VOLUME_SMA_PERIOD, min_periods=VOLUME_SMA_PERIOD // 2).mean()
+    df['volume_std'] = df['volume'].rolling(window=VOLUME_SMA_PERIOD, min_periods=VOLUME_SMA_PERIOD // 2).std()
+    volume_std_safe = df['volume_std'].replace(0, 1e-10)
+    df['volume_z'] = (df['volume'] - df['volume_sma']) / volume_std_safe
+    df.drop(columns=['volume_sma', 'volume_std'], inplace=True, errors='ignore')
+
+    # RSI Lag
+    df['rsi_lag1'] = df['rsi'].shift(1)
+
+    # Cyclical Time Features
+    if isinstance(df.index, pd.DatetimeIndex):
+        df['hour'] = df.index.hour; df['dayofweek'] = df.index.dayofweek
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24.0); df['hour_cos'] = np.cos(2 * np.pi * df['hour']/24.0)
+        df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek']/7.0); df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek']/7.0)
+        df.drop(columns=['hour', 'dayofweek'], inplace=True)
+    elif 'hour_sin' not in df.columns:
+        for tf in ['hour_sin', 'hour_cos', 'dayofweek_sin', 'dayofweek_cos']: df[tf] = np.nan
+
+    # Return Feature
+    df['return_1'] = df['close'].pct_change(1)
+
+    # --- Relative Strength / Context Features ---
+    df['rel_return_1'] = np.nan
+    df['rel_rsi'] = np.nan
+    df['rel_volume_z'] = np.nan
+    if index_features is not None and isinstance(index_features, pd.DataFrame) and not index_features.empty:
+        # Check for BASE feature names in the passed index_features DataFrame
+        required_idx_cols = INDEX_CONTEXT_BASE_COLS # Use defined list
+        if all(col in index_features.columns for col in required_idx_cols):
+            aligned_idx_features = index_features[required_idx_cols].reindex(df.index, method='ffill', limit=5)
+            # Use .sub for safer subtraction with NaNs, fill_value=0 implies no index change if missing
+            df['rel_return_1'] = df['return_1'].sub(aligned_idx_features['return_1'], fill_value=0)
+            # For RSI, filling with mean might make more sense than 0
+            rsi_fill_val = df['rsi'].mean() if df['rsi'].notna().any() else 0
+            df['rel_rsi'] = df['rsi'].sub(aligned_idx_features['rsi'], fill_value=rsi_fill_val)
+            df['rel_volume_z'] = df['volume_z'].sub(aligned_idx_features['volume_z'], fill_value=0)
+        else:
+             print(f"[WARN calculate_features] Missing required base cols {required_idx_cols} in index_features for relative calc.")
+    # elif index_features is None:
+        # This case is expected when processing the index itself
+        # print(f"[DEBUG calculate_features] index_features is None. Skipping relative features.")
+    # else:
+    #     print(f"[WARN calculate_features] index_features invalid type or empty; cannot calculate relative features.")
+
+
+    # --- Lagged Features ---
+    features_to_lag = ['return_1', 'macd_hist', 'stoch_k', 'atr', 'bb_width', 'rel_return_1']
+    for feature in features_to_lag:
+        if feature in df.columns:
+            for lag in LAG_PERIODS:
+                col_name = f'{feature}_lag{lag}'
+                df[col_name] = df[feature].shift(lag)
+
+    # ---> REMOVED FINAL DROPNA <---
+    return df
+
+# --- Signal Generation Function ---
+def generate_entry_signals(df):
+    """
+    Identifies potential entry signals based on various technical conditions.
+    Returns a Series with signal type (int > 0) or 0 if no signal.
+    """
+    signals = pd.Series(0, index=df.index, dtype=int)
+
+    req_cols = ['macd', 'macd_signal', 'rsi', 'stoch_k', 'close', 'lower_band', 'upper_band', 'volume_z']
+    if not all(col in df.columns for col in req_cols):
+        print(f"[WARN generate_entry_signals] Missing required columns: {[c for c in req_cols if c not in df.columns]}. Returning no signals.")
+        return signals
+
+    # Calculate conditions, handling potential NaNs
+    macd_hist = df['macd'].sub(df['macd_signal'], fill_value=0)
+    macd_cross_bull = (macd_hist > 0) & (macd_hist.shift(1).fillna(0) <= 0)
+    macd_cross_bear = (macd_hist < 0) & (macd_hist.shift(1).fillna(0) >= 0)
+    rsi_cross_above_os = (df['rsi'] > RSI_OVERSOLD) & (df['rsi'].shift(1).fillna(RSI_OVERSOLD) <= RSI_OVERSOLD)
+    rsi_cross_below_ob = (df['rsi'] < RSI_OVERBOUGHT) & (df['rsi'].shift(1).fillna(RSI_OVERBOUGHT) >= RSI_OVERBOUGHT)
+    stoch_cross_above_os = (df['stoch_k'] > STOCH_OVERSOLD) & (df['stoch_k'].shift(1).fillna(STOCH_OVERSOLD) <= STOCH_OVERSOLD)
+    stoch_cross_below_ob = (df['stoch_k'] < STOCH_OVERBOUGHT) & (df['stoch_k'].shift(1).fillna(STOCH_OVERBOUGHT) >= STOCH_OVERBOUGHT)
+    bb_rev_long = (df['close'] < df['lower_band']) & (df['volume_z'].fillna(0) > VOLUME_Z_THRESH)
+    bb_rev_short = (df['close'] > df['upper_band']) & (df['volume_z'].fillna(0) < -VOLUME_Z_THRESH)
+
+    # Assign signals using .loc to handle potential index mismatches after NaNs
+    signals.loc[macd_cross_bull & (df['rsi'].fillna(RSI_MID) > RSI_MID)] = 1
+    signals.loc[macd_cross_bear & (df['rsi'].fillna(RSI_MID) < RSI_MID)] = 2
+    signals.loc[rsi_cross_above_os] = 3
+    signals.loc[rsi_cross_below_ob] = 4
+    signals.loc[stoch_cross_above_os] = 5
+    signals.loc[stoch_cross_below_ob] = 6
+    signals.loc[bb_rev_long] = 7
+    signals.loc[bb_rev_short] = 8
+
+    return signals
+
+# --- Labeling Function based on Signal Outcome ---
+def label_signal_outcome_tp_sl(df, signal_indices, lookahead_bars, sl_mult, tp_mult):
+    """Labels signals based on whether TP is hit before SL."""
+    labels = pd.Series(np.nan, index=signal_indices)
+
+    if signal_indices.empty or not isinstance(df.index, pd.DatetimeIndex): return labels.dropna().astype(int)
+    # Ensure signal_indices are actually present in the DataFrame index (post-dropna)
+    signal_indices = signal_indices.intersection(df.index)
+    if signal_indices.empty: return labels.dropna().astype(int)
+
+    if 'atr' not in df.columns or 'signal_type' not in df.columns:
+         print("[ERROR label_signal_outcome_tp_sl] Missing 'atr' or 'signal_type'. Cannot label.")
+         return labels.dropna().astype(int)
+
+    valid_signals = df.loc[signal_indices, ['atr', 'close', 'high', 'low', 'signal_type']].copy()
+    valid_signals.dropna(subset=['atr', 'close', 'high', 'low', 'signal_type'], inplace=True)
+    valid_signals = valid_signals[valid_signals['atr'] > 1e-9]
+
+    if valid_signals.empty:
+        print("[WARN label_signal_outcome_tp_sl] No valid signals found after filtering.")
+        return labels.dropna().astype(int)
+
+    print(f"{datetime.now()} - [INFO label_signal_outcome_tp_sl] Labeling {len(valid_signals)} signals...")
+
+    df_len = len(df)
+    df_index = df.index
+    df_lows = df['low'].values
+    df_highs = df['high'].values
+
+    for idx in valid_signals.index:
+        signal_data = valid_signals.loc[idx]
+        entry_price = signal_data['close']
+        atr = signal_data['atr']
+        signal_type = int(signal_data['signal_type'])
+        is_long = signal_type in [1, 3, 5, 7]
+
+        if is_long: stop_loss = entry_price - sl_mult * atr; take_profit = entry_price + tp_mult * atr
+        else: stop_loss = entry_price + sl_mult * atr; take_profit = entry_price - tp_mult * atr
+
+        try: entry_loc = df_index.get_loc(idx)
+        except KeyError: continue # Should not happen if indices are intersected
+
+        start_lookahead = entry_loc + 1
+        end_lookahead = min(entry_loc + 1 + lookahead_bars, df_len)
+
+        if start_lookahead >= end_lookahead: continue
+
+        future_lows_slice = df_lows[start_lookahead:end_lookahead]
+        future_highs_slice = df_highs[start_lookahead:end_lookahead]
+
+        hit_tp = False; hit_sl = False; tp_idx = -1; sl_idx = -1
+
+        try:
+            if is_long:
+                tp_indices = np.where(future_highs_slice >= take_profit)[0]
+                sl_indices = np.where(future_lows_slice <= stop_loss)[0]
+            else: # Short
+                tp_indices = np.where(future_lows_slice <= take_profit)[0]
+                sl_indices = np.where(future_highs_slice >= stop_loss)[0]
+
+            if tp_indices.size > 0: hit_tp = True; tp_idx = tp_indices[0]
+            if sl_indices.size > 0: hit_sl = True; sl_idx = sl_indices[0]
+
+            label = 0 # Default loss
+            if hit_tp and hit_sl:
+                if tp_idx <= sl_idx: label = 1
+            elif hit_tp:
+                label = 1
+
+            labels.loc[idx] = label
+        except Exception as e:
+             print(f"[ERROR label_signal_outcome_tp_sl] Error in TP/SL check for {idx}: {e}")
+             labels.loc[idx] = np.nan
+
+    labels.dropna(inplace=True)
+    labels = labels.astype(int)
+    print(f"{datetime.now()} - [INFO label_signal_outcome_tp_sl] Finished labeling. {len(labels)} signals labeled.")
+    return labels
+
+
+# --- Helper function to process index data ---
+def process_index_data(index_symbol, data_dir, filename_template):
+    """Loads 5-min index data, calculates ALL features on it, returns full features DF."""
+    print(f"\n{datetime.now()} - [INFO process_index_data] --- Processing Index Symbol: {index_symbol} ---")
+    file_path = os.path.join(data_dir, filename_template.format(index_symbol))
+    if not os.path.exists(file_path): print(f"[ERROR process_index_data] Index data file not found: {file_path}"); return None
+    index_data = None
+    try:
+        print(f"{datetime.now()} - [INFO process_index_data] Loading 5-minute data for {index_symbol}...");
+        try:
+            index_data = pd.read_csv(file_path, parse_dates=['date'], date_format='%Y-%m-%d %H:%M:%S', index_col='date')
+            if not isinstance(index_data.index, pd.DatetimeIndex): raise ValueError("Not DatetimeIndex")
+            index_data.sort_index(inplace=True)
+        except Exception as e:
+            print(f"[WARN process_index_data] Initial load failed: {e}. Fallback.")
+            index_data = pd.read_csv(file_path)
+            if 'date' not in index_data.columns: raise ValueError("'date' missing")
+            index_data['date'] = pd.to_datetime(index_data['date'], errors='coerce'); index_data.dropna(subset=['date'], inplace=True)
+            if index_data.empty: raise ValueError("No valid dates.")
+            index_data.set_index('date', inplace=True); index_data.sort_index(inplace=True)
+        print(f"{datetime.now()} - [INFO process_index_data] Loaded {len(index_data)} rows (5-min).")
+        if index_data.empty: raise ValueError("Index data empty.")
+
+        print(f"{datetime.now()} - [INFO process_index_data] Cleaning index OHLCV...");
+        initial_rows = len(index_data); ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in ohlcv_cols:
+            if col in index_data.columns: index_data[col] = pd.to_numeric(index_data[col], errors='coerce')
+        index_data.dropna(subset=[c for c in ohlcv_cols if c in index_data.columns], inplace=True)
+        if index_data.empty: raise ValueError("Index data empty after cleaning.")
+
+        print(f"{datetime.now()} - [INFO process_index_data] Calculating index features (5-min data)...")
+        # Calculate ALL features on the index data itself (pass None for index_features)
+        index_features_df = calculate_features(index_data.copy(), index_features=None)
+        # ---> DO NOT check if empty here; calculate_features now returns NaNs <---
+
+        if index_features_df is None or index_features_df.empty: # Check if calculation itself failed
+             print(f"[ERROR process_index_data] calculate_features returned empty or None for index. Check index data.")
+             return None
+
+        print(f"{datetime.now()} - [INFO process_index_data] Finished processing index. Full features shape: {index_features_df.shape}")
+        # ---> RETURN THE FULL FEATURES DATAFRAME (with potential NaNs) <---
+        return index_features_df
+
+    except Exception as e:
+        print(f"\n[ERROR process_index_data] Error processing index {index_symbol}: {e}"); traceback.print_exc(); return None
+
+
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    all_symbol_signal_data = []
+    print(f"{datetime.now()} - [INFO Main] Script starting. Revamped Logic: Multi-Signal TP/SL Labeling.")
+
+    # --- Pre-process Index Data (get FULL features DF with potential NaNs) ---
+    index_features_df = process_index_data(INDEX_SYMBOL, DATA_DIR, FILENAME_TEMPLATE)
+    if index_features_df is None or index_features_df.empty:
+        print(f"{datetime.now()} - [ERROR Main] Failed to process index data or result is empty. Exiting."); exit()
+
+    print(f"{datetime.now()} - [INFO Main] Starting data processing loop for {len(SYMBOLS)} symbols...")
+    for symbol in SYMBOLS:
+        if symbol == INDEX_SYMBOL:
+            print(f"\n{datetime.now()} - [INFO Main] --- Skipping Index Symbol {symbol} ---")
+            continue
+
+        print(f"\n{datetime.now()} - [INFO Main] --- Processing Symbol: {symbol} ---")
+        file_path = os.path.join(DATA_DIR, FILENAME_TEMPLATE.format(symbol))
+        if not os.path.exists(file_path): print(f"[WARN Main] Data file not found: {file_path}. Skipping."); continue
+        data = None
+        try:
+            # --- Load 5-min data ---
+            print(f"{datetime.now()} - [INFO Main] Loading 5-minute data for {symbol}...");
+            try: # Simplified Loading
+                data = pd.read_csv(file_path, parse_dates=['date'], date_format='%Y-%m-%d %H:%M:%S', index_col='date')
+                if not isinstance(data.index, pd.DatetimeIndex): raise ValueError("Not DatetimeIndex")
+                data.sort_index(inplace=True)
+            except Exception as e:
+                 print(f"[WARN Main] Initial load failed: {e}. Fallback.")
+                 data = pd.read_csv(file_path)
+                 if 'date' not in data.columns: raise ValueError("'date' missing")
+                 data['date'] = pd.to_datetime(data['date'], errors='coerce'); data.dropna(subset=['date'], inplace=True)
+                 if data.empty: raise ValueError("No valid dates.")
+                 data.set_index('date', inplace=True); data.sort_index(inplace=True)
+            print(f"{datetime.now()} - [INFO Main] Loaded {len(data)} rows (5-min).")
+            if data.empty: print(f"[ERROR Main] Data empty after loading."); continue
+
+            # --- Clean OHLCV ---
+            print(f"{datetime.now()} - [INFO Main] Cleaning OHLCV columns...");
+            initial_rows = len(data); ohlcv_cols = ['open', 'high', 'low', 'close', 'volume']
+            for col in ohlcv_cols:
+                 if col in data.columns: data[col] = pd.to_numeric(data[col], errors='coerce')
+            data.dropna(subset=[c for c in ohlcv_cols if c in data.columns], inplace=True)
+            if data.empty: print(f"[ERROR Main] Data empty after cleaning."); continue
+            if len(data) < MIN_ROWS_PER_SYMBOL: # Check length after cleaning
+                print(f"[WARN Main] Insufficient data ({len(data)}) after cleaning for {symbol}. Skipping."); continue
+
+            # --- Calculate Stock + Relative Features (Pass full index features DF) ---
+            print(f"{datetime.now()} - [INFO Main] Calculating features for {symbol} (incl. relative)...")
+            data = calculate_features(data.copy(), index_features=index_features_df) # Pass copy
+            print(f"{datetime.now()} - [INFO Main] Features calculated. Shape before final dropna: {data.shape}")
+            if data.empty: print(f"[ERROR Main] Data empty immediately after feature calculation (before dropna). Problem in calc function?"); continue
+
+            # ---> Drop rows with ANY NaNs AFTER all features (incl. relative) are calculated <---
+            initial_rows_dropna = len(data)
+            data.dropna(inplace=True)
+            rows_dropped_final = initial_rows_dropna - len(data)
+            print(f"{datetime.now()} - [INFO Main] Dropped {rows_dropped_final} rows with NaNs. Final usable shape for signals/labeling: {data.shape}")
+            if data.empty: print(f"[ERROR Main] Data empty after final feature dropna for {symbol}. Skipping."); continue
+            if len(data) < MIN_ROWS_PER_SYMBOL: # Check length after dropna
+                print(f"[WARN Main] Insufficient data ({len(data)}) after feature calculation/dropna for {symbol}. Skipping."); continue
+
+            # --- REMOVED separate Join step ---
+
+            # --- Generate Entry Signals (on the cleaned data) ---
+            print(f"{datetime.now()} - [INFO Main] Generating entry signals for {symbol}...")
+            data[SIGNAL_TYPE_COL] = generate_entry_signals(data)
+            signals_found_indices = data.index[data[SIGNAL_TYPE_COL] > 0] # Get indices AFTER dropna
+            print(f"{datetime.now()} - [INFO Main] Found {len(signals_found_indices)} potential signal events for {symbol}.")
+            if signals_found_indices.empty: print(f"[INFO Main] No signals found for {symbol}. Skipping."); continue
+
+            # --- Label Signal Outcomes ---
+            print(f"{datetime.now()} - [INFO Main] Labeling signal outcomes (TP/SL) for {symbol}...")
+            # Pass the fully cleaned data DF and the indices where signals occurred
+            labels = label_signal_outcome_tp_sl(data, signals_found_indices, LOOKAHEAD_BARS_TP_SL, SL_MULT, TP_MULT)
+            if labels.empty: print(f"[INFO Main] No signals could be labeled for {symbol}. Skipping."); continue
+
+            # --- Prepare Data for Model ---
+            # Select only the rows where signals were found AND successfully labeled
+            model_data = data.loc[labels.index].copy()
+            model_data['label'] = labels # Add the outcome label
+            model_data['symbol'] = symbol # Add symbol identifier
+
+            # Define columns to keep (Use the list defined near top)
+            cols_to_keep = base_feature_columns + [SIGNAL_TYPE_COL, 'label', 'symbol']
+            # Verify columns exist in the potentially reduced 'model_data' DataFrame
+            missing_cols = [c for c in cols_to_keep if c not in model_data.columns]
+            if missing_cols:
+                print(f"[ERROR Main] Critical features missing before final selection: {missing_cols}. Skipping {symbol}.")
+                continue
+
+            final_symbol_data = model_data[cols_to_keep].copy()
+
+            # Final NaN check (should be minimal/none)
+            if final_symbol_data.isnull().values.any():
+                print(f"[WARN Main] NaNs detected in final data. Dropping.");
+                initial_count = len(final_symbol_data); final_symbol_data.dropna(inplace=True);
+                print(f"Dropped {initial_count - len(final_symbol_data)} rows.")
+
+            if len(final_symbol_data) < MIN_SIGNAL_ROWS_PER_SYMBOL:
+                print(f"[WARN Main] Insufficient labeled signal data ({len(final_symbol_data)} < {MIN_SIGNAL_ROWS_PER_SYMBOL}). Skipping."); continue
+
+            all_symbol_signal_data.append(final_symbol_data)
+            print(f"{datetime.now()} - [INFO Main] Successfully processed {symbol}. Added {len(final_symbol_data)} labeled signal events.")
+
+        except Exception as e:
+            print(f"\n{datetime.now()} - [ERROR Main] --- Unexpected error processing symbol: {symbol} ---")
+            print(f"Error Type: {type(e).__name__}, Message: {e}"); traceback.print_exc()
+            print(f"{datetime.now()} - [INFO Main] --- Skipping rest of processing for {symbol} ---"); continue
+
+    # --- Model Training and Evaluation ---
+    print(f"\n{datetime.now()} - [INFO Main] --- Data Processing Complete ---")
+    if not all_symbol_signal_data: print(f"[ERROR Main] No labeled signal data collected. Cannot train."); exit()
+
+    print(f"{datetime.now()} - [INFO Main] Combining data from {len(all_symbol_signal_data)} symbols...")
+    combined_data = pd.concat(all_symbol_signal_data)
+    print(f"{datetime.now()} - [INFO Main] Total labeled signal events: {len(combined_data)}")
+
+    print(f"{datetime.now()} - [INFO Main] Sorting combined data by timestamp...")
+    combined_data.sort_index(inplace=True)
+    print(f"{datetime.now()} - [INFO Main] Combined data sorted.")
+
+    # One-Hot Encode Categorical Features
+    print(f"{datetime.now()} - [INFO Main] One-hot encoding categorical features...")
+    categorical_cols = ['symbol', SIGNAL_TYPE_COL]
+    try:
+        combined_data[SIGNAL_TYPE_COL] = combined_data[SIGNAL_TYPE_COL].astype(int).astype(str) # Ensure string type
+        combined_data = pd.get_dummies(combined_data, columns=categorical_cols, prefix=['sym', 'sig'], drop_first=False)
+        print(f"{datetime.now()} - [INFO Main] OHE complete. Shape: {combined_data.shape}")
+    except KeyError as e: print(f"[ERROR Main] Failed OHE - column missing? {e}"); exit()
+    except Exception as e_ohe: print(f"[ERROR Main] Failed OHE: {e_ohe}"); exit()
+
+    # Define final feature columns INCLUDING OHE versions
+    final_feature_columns = base_feature_columns.copy()
+    final_feature_columns = [col for col in final_feature_columns if col not in categorical_cols] # Remove originals
+    ohe_cols = [col for col in combined_data.columns if col.startswith('sym_') or col.startswith('sig_')]
+    final_feature_columns.extend(ohe_cols)
+    final_feature_columns = sorted(list(set(final_feature_columns)))
+    print(f"{datetime.now()} - [INFO Main] Final feature columns count: {len(final_feature_columns)}")
+
+    # Final check for NaNs before splitting
+    if combined_data.isnull().values.any():
+        print(f"[WARN Main] NaNs detected before split."); nan_counts = combined_data.isnull().sum(); print("NaN counts:\n", nan_counts[nan_counts > 0])
+        print("Dropping NaNs..."); combined_data.dropna(inplace=True); print(f"Rows remaining: {len(combined_data)}")
+        if combined_data.empty: print("[ERROR Main] Combined data empty after final NaN drop."); exit()
+
+    print(f"{datetime.now()} - [INFO Main] Separating features (X) and labels (y)...")
+    missing_final_features = [f for f in final_feature_columns if f not in combined_data.columns]
+    if missing_final_features: print(f"[ERROR Main] Missing final features: {missing_final_features}"); exit()
+    if 'label' not in combined_data.columns: print("[ERROR Main] 'label' column missing!"); exit()
+    X = combined_data[final_feature_columns]; y = combined_data['label']
+    print(f"{datetime.now()} - [INFO Main] Feature matrix shape: {X.shape}")
+    if len(X) == 0 or len(y) == 0: print("[ERROR Main] X or y empty."); exit()
+    if len(y.unique()) < 2: print(f"[ERROR Main] Only one class found: {y.unique()}"); exit()
+    print(f"Label distribution in combined data: {y.value_counts(normalize=True).to_dict()}")
+
+    # Train/Test Split
+    split_index = int(len(X) * (1 - TEST_SIZE))
+    X_train = X.iloc[:split_index]; X_test = X.iloc[split_index:]
+    y_train = y.iloc[:split_index]; y_test = y.iloc[split_index:]
+    print(f"\n{datetime.now()} - [INFO Main] Splitting data chronologically:")
+    print(f"Training set size: {len(X_train)} ({X_train.index.min()} to {X_train.index.max()})")
+    print(f"Testing set size : {len(X_test)} ({X_test.index.min()} to {X_test.index.max()})")
+    if len(X_train) == 0 or len(X_test) == 0: print("[ERROR Main] Empty train/test set."); exit()
+
+    # Feature Scaling
+    scaler = None
+    if USE_FEATURE_SCALING:
+        print(f"\n{datetime.now()} - [INFO Main] Applying StandardScaler...");
+        # Identify numeric cols EXCLUDING OHE cols
+        numeric_cols_to_scale_final = [
+            col for col in X_train.columns if
+            col in base_feature_columns and # Check against base list (incl relative)
+            not col.startswith('sym_') and not col.startswith('sig_')
+        ]
+        cols_to_scale_present_train = [col for col in numeric_cols_to_scale_final if col in X_train.columns]
+        cols_to_scale_present_test = [col for col in numeric_cols_to_scale_final if col in X_test.columns]
+
+        if not cols_to_scale_present_train:
+             print(f"[WARN Main] No numeric (non-OHE) columns found for scaling.")
+        else:
+            print(f"{datetime.now()} - [INFO Main] Scaling {len(cols_to_scale_present_train)} numeric columns...")
+            scaler = StandardScaler()
+            # Use .loc to avoid SettingWithCopyWarning
+            X_train.loc[:, cols_to_scale_present_train] = scaler.fit_transform(X_train[cols_to_scale_present_train])
+            if cols_to_scale_present_test:
+                 cols_to_transform = [col for col in cols_to_scale_present_train if col in cols_to_scale_present_test]
+                 if cols_to_transform:
+                      X_test.loc[:, cols_to_transform] = scaler.transform(X_test[cols_to_transform])
+                 else: print(f"[WARN Main] No matching columns in test set for scaling.")
+            else: print(f"[WARN Main] No numeric columns identified for scaling in test set.")
+            print(f"{datetime.now()} - [INFO Main] StandardScaler applied.")
+
+    # --- Model Training: XGBoost ---
+    print(f"\n{datetime.now()} - [INFO Main] --- Training XGBoost Model ---")
+    scale_pos_weight = (y_train == 0).sum() / max(1, (y_train == 1).sum())
+    print(f"{datetime.now()} - [INFO Main] Calculated scale_pos_weight: {scale_pos_weight:.2f}")
+    min_samples_per_split = len(X_train) // (N_CV_SPLITS + 1)
+    if min_samples_per_split < 2:
+        print(f"[WARN Main] Training data size ({len(X_train)}) too small for {N_CV_SPLITS} splits. Reducing.")
+        actual_n_splits = max(2, len(X_train) // 2) if len(X_train) >= 4 else 1
+        if actual_n_splits < 2: print("[ERROR Main] Not enough data for even 2 CV splits."); exit()
+    else: actual_n_splits = N_CV_SPLITS
+    print(f"{datetime.now()} - [INFO Main] Using TimeSeriesSplit with n_splits={actual_n_splits}")
+    tscv = TimeSeriesSplit(n_splits=actual_n_splits)
+    xgb_model = XGBClassifier(
+        tree_method='hist', device='cuda', random_state=RANDOM_STATE,
+        eval_metric='logloss', use_label_encoder=False, scale_pos_weight=scale_pos_weight
+    )
+    xgb_search = RandomizedSearchCV(
+        estimator=xgb_model, param_distributions=XGB_PARAM_DIST, n_iter=N_RANDOM_SEARCH_ITER,
+        scoring='accuracy', cv=tscv, n_jobs=-1, verbose=1, random_state=RANDOM_STATE
+    )
+    print(f"{datetime.now()} - [INFO Main] Starting RandomizedSearchCV for XGBoost ({N_RANDOM_SEARCH_ITER} iterations)...")
+    xgb_search_start_time = datetime.now()
+    best_xgb_model = None
+    try:
+        xgb_search.fit(X_train, y_train)
+        xgb_search_end_time = datetime.now()
+        print(f"\n{datetime.now()} - [INFO Main] XGBoost RandomizedSearchCV finished. Duration: {xgb_search_end_time - xgb_search_start_time}")
+        print("Best XGBoost parameters found:", xgb_search.best_params_)
+        print(f"Best XGBoost CV score (accuracy): {xgb_search.best_score_:.4f}")
+        best_xgb_model = xgb_search.best_estimator_
+    except Exception as e:
+        xgb_search_end_time = datetime.now(); print(f"\n[ERROR Main] ERROR during XGB RandomizedSearchCV: {e}. Duration: {xgb_search_end_time - xgb_search_start_time}");
+
+    # --- Model Evaluation: XGBoost ---
+    if best_xgb_model:
+        print(f"\n{datetime.now()} - [INFO Main] Evaluating XGBoost model on test set...")
+        y_pred_xgb = best_xgb_model.predict(X_test)
+        y_prob_xgb = best_xgb_model.predict_proba(X_test)[:, 1]
+        print(f"\nXGBoost Test Set Accuracy: {accuracy_score(y_test, y_pred_xgb):.4f}")
+        print("XGBoost Test Set Classification Report:\n", classification_report(y_test, y_pred_xgb, target_names=['SL Hit First (0)', 'TP Hit First (1)'], zero_division=0))
+        print("\nXGBoost Confusion Matrix:\n", confusion_matrix(y_test, y_pred_xgb))
+        print(f"\nXGBoost Predicted Probability (Class 1) Stats: Min={np.min(y_prob_xgb):.3f}, Mean={np.mean(y_prob_xgb):.3f}, Max={np.max(y_prob_xgb):.3f}, Std={np.std(y_prob_xgb):.3f}")
+
+        # --- SHAP Analysis for XGBoost ---
+        print(f"\n{datetime.now()} - [INFO Main] Calculating SHAP values for XGBoost (on test set sample)...")
+        try:
+            explainer = shap.TreeExplainer(best_xgb_model)
+            sample_size_shap = min(len(X_test), 1000)
+            if sample_size_shap > 0:
+                X_test_sample_shap = X_test.sample(sample_size_shap, random_state=RANDOM_STATE)
+                try:
+                    shap_values = explainer.shap_values(X_test_sample_shap)
+                except TypeError:
+                     print("[WARN SHAP] SHAP calculation failed with TypeError, attempting conversion...")
+                     shap_values = explainer.shap_values(X_test_sample_shap.values)
+
+                if isinstance(shap_values, list) and len(shap_values) > 1:
+                    shap_values_for_plot = shap_values[1]
+                else:
+                    shap_values_for_plot = shap_values
+
+                print(f"{datetime.now()} - [INFO Main] Generating SHAP summary plot...")
+                shap.summary_plot(shap_values_for_plot, X_test_sample_shap, plot_type="bar", max_display=30, show=False)
+                if MATPLOTLIB_INSTALLED:
+                    try:
+                        plt.title(f"SHAP Importance (XGB - TP Hit First) - {sample_size_shap} samples")
+                        plt.savefig("shap_summary_xgb_tp_sl.png", bbox_inches='tight'); plt.close()
+                        print("SHAP summary plot saved to shap_summary_xgb_tp_sl.png")
+                    except Exception as plot_e: print(f"[ERROR Main] Error saving SHAP plot: {plot_e}")
+                else: print("[WARN Main] Matplotlib not installed. Cannot save SHAP plot.")
+            else: print("[WARN Main] Test set empty or too small for SHAP sampling.")
+        except Exception as shap_e: print(f"[ERROR Main] Could not calculate or plot SHAP values: {shap_e}")
+
+        # --- Save Best XGBoost Model ---
+        xgb_model_filename = 'revamped_xgb_model_tp_sl_v1.joblib'
+        joblib.dump(best_xgb_model, xgb_model_filename); print(f"Best XGBoost model saved to '{xgb_model_filename}'")
+
+    # --- Model Training: Logistic Regression ---
+    print(f"\n{datetime.now()} - [INFO Main] --- Training Logistic Regression Model ---")
+    logreg_model = LogisticRegression(random_state=RANDOM_STATE, class_weight='balanced', max_iter=1000)
+    logreg_search = GridSearchCV(logreg_model, LOGREG_PARAMS, cv=tscv, scoring='accuracy', verbose=1, n_jobs=-1)
+    print(f"{datetime.now()} - [INFO Main] Starting GridSearchCV for Logistic Regression...")
+    logreg_search_start_time = datetime.now()
+    best_logreg_model = None
+    try:
+        logreg_search.fit(X_train, y_train) # Use the same scaled data
+        logreg_search_end_time = datetime.now()
+        print(f"\n{datetime.now()} - [INFO Main] Logistic Regression GridSearchCV finished. Duration: {logreg_search_end_time - logreg_search_start_time}")
+        print("Best Logistic Regression parameters found:", logreg_search.best_params_)
+        print(f"Best Logistic Regression CV score (accuracy): {logreg_search.best_score_:.4f}")
+        best_logreg_model = logreg_search.best_estimator_
+    except Exception as e: logreg_search_end_time = datetime.now(); print(f"\n[ERROR Main] ERROR during Logistic Regression GridSearchCV: {e}. Duration: {logreg_search_end_time - logreg_search_start_time}");
+
+    # --- Model Evaluation: Logistic Regression ---
+    if best_logreg_model:
+        print(f"\n{datetime.now()} - [INFO Main] Evaluating Logistic Regression model on test set...")
+        y_pred_logreg = best_logreg_model.predict(X_test)
+        y_prob_logreg = best_logreg_model.predict_proba(X_test)[:, 1]
+        print(f"\nLogistic Regression Test Set Accuracy: {accuracy_score(y_test, y_pred_logreg):.4f}")
+        print("Logistic Regression Test Set Classification Report:\n", classification_report(y_test, y_pred_logreg, target_names=['SL Hit First (0)', 'TP Hit First (1)'], zero_division=0))
+        print("\nLogistic Regression Confusion Matrix:\n", confusion_matrix(y_test, y_pred_logreg))
+        print(f"\nLogReg Predicted Probability (Class 1) Stats: Min={np.min(y_prob_logreg):.3f}, Mean={np.mean(y_prob_logreg):.3f}, Max={np.max(y_prob_logreg):.3f}, Std={np.std(y_prob_logreg):.3f}")
+        logreg_model_filename = 'revamped_logreg_model_tp_sl_v1.joblib'
+        joblib.dump(best_logreg_model, logreg_model_filename); print(f"Best Logistic Regression model saved to '{logreg_model_filename}'")
+
+    # --- Save Final Features and Scaler ---
+    feature_list_filename = 'revamped_model_features_tp_sl_v1.list'
+    try:
+         current_features = list(X_train.columns) # Features used for training
+         with open(feature_list_filename, 'w') as f:
+              for feature in current_features: f.write(f"{feature}\n")
+         print(f"Final feature list ({len(current_features)}) saved to '{feature_list_filename}'")
+    except Exception as fl_e: print(f"Error saving feature list: {fl_e}")
+    if scaler:
+        scaler_filename = 'revamped_feature_scaler_tp_sl_v1.joblib'
+        joblib.dump(scaler, scaler_filename); print(f"Scaler saved to '{scaler_filename}'")
+
+    print(f"\n{datetime.now()} - [INFO Main] --- Script Finished ---")
