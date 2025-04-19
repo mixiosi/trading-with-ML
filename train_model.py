@@ -5,22 +5,43 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 import joblib
+import glob
 
-# Step 1: Load Historical Data
+# Step 1: Load Historical Data for Multiple Symbols
 # Specify the date format to ensure consistent parsing
-data = pd.read_csv('NVDA_5min_historical_data.csv', parse_dates=['date'], date_format='%Y%m%d %H:%M:%S US/Eastern')
-print("Data shape:", data.shape)
-print("First few rows:\n", data.head())
+data_files = glob.glob('*.csv')  # Load all CSV files in the current directory
+all_data = []
+
+for file in data_files:
+    # Assuming the filename contains the symbol (e.g., NVDA_5min_historical_data.csv)
+    symbol = file.split('_')[0]
+    try:
+        df = pd.read_csv(file, parse_dates=['date'], date_format='%Y%m%d %H:%M:%S US/Eastern')
+        df['symbol'] = symbol  # Add a 'symbol' column
+        all_data.append(df)
+        print(f"Loaded data for {symbol} from {file}")
+    except Exception as e:
+        print(f"Error loading data for {symbol} from {file}: {e}")
+
+if not all_data:
+    print("No data loaded.  Please check your CSV files and path.")
+    exit()
+
+data = pd.concat(all_data, ignore_index=True) # Combine all dataframes
+
+
+print("Combined Data shape:", data.shape)
+print("First few rows of combined data:\n", data.head())
 
 # Step 2: Calculate Indicators and Features
 def calculate_features(df):
     """Calculate technical indicators and features for the dataset."""
-    df['sma20'] = df['close'].rolling(window=20).mean()  # 20-period Simple Moving Average
-    df['std20'] = df['close'].rolling(window=20).std()   # 20-period Standard Deviation
-    df['upper_band'] = df['sma20'] + 2 * df['std20']     # Upper Bollinger Band
-    df['lower_band'] = df['sma20'] - 2 * df['std20']     # Lower Bollinger Band
-    df['atr'] = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=14)  # 14-period ATR
-    df['rsi'] = talib.RSI(df['close'].values, timeperiod=14)  # 14-period RSI
+    df['sma20'] = df.groupby('symbol')['close'].rolling(window=20).mean().reset_index(level=0, drop=True)
+    df['std20'] = df.groupby('symbol')['close'].rolling(window=20).std().reset_index(level=0, drop=True)
+    df['upper_band'] = df['sma20'] + 2 * df['std20']
+    df['lower_band'] = df['sma20'] - 2 * df['std20']
+    df['atr'] = df.groupby('symbol').apply(lambda x: talib.ATR(x['high'].values, x['low'].values, x['close'].values, timeperiod=14)).reset_index(level=0, drop=True)
+    df['rsi'] = df.groupby('symbol').apply(lambda x: talib.RSI(x['close'].values, timeperiod=14)).reset_index(level=0, drop=True)
     return df
 
 data = calculate_features(data)
@@ -30,62 +51,66 @@ def generate_signals_and_labels(df):
     """Generate trading signals and label them as profitable (1) or unprofitable (0)."""
     signals = []
     labels = []
-    long_crossings = 0
-    short_crossings = 0
-    for i in range(20, len(df) - 1):  # Start after indicators are calculated
-        close = df['close'].iloc[i]
-        lower_band = df['lower_band'].iloc[i]
-        upper_band = df['upper_band'].iloc[i]
-        sma20 = df['sma20'].iloc[i]
-        std20 = df['std20'].iloc[i]
-        atr = df['atr'].iloc[i]
-        rsi = df['rsi'].iloc[i]
-        volume = df['volume'].iloc[i]
-        mean_vol = df['volume'].iloc[i-5:i].mean()  # 5-period mean volume
-        vol_z = (volume - mean_vol) / mean_vol if mean_vol != 0 else 0  # Volume Z-score
+    long_crossings = {}
+    short_crossings = {}
 
-        if close < lower_band:
-            long_crossings += 1
-            if vol_z > 0.05:  # Long signal condition
-                entry_price = close
-                stop_loss = entry_price - 2.5 * atr
-                take_profit = entry_price + 5 * atr
-                future_prices = df['close'].iloc[i+1:]
-                hit_tp = any(future_prices >= take_profit)
-                hit_sl = any(future_prices <= stop_loss)
-                if hit_tp and (not hit_sl or future_prices[future_prices >= take_profit].index[0] < 
-                               future_prices[future_prices <= stop_loss].index[0]):
-                    label = 1  # Profitable
-                else:
-                    label = 0  # Unprofitable
-                deviation = (close - sma20) / std20
-                atr_norm = atr / close
-                signals.append([deviation, vol_z, atr_norm, rsi])
-                labels.append(label)
-                print(f"Long signal at index {i}: close={close}, lower_band={lower_band}, vol_z={vol_z}, label={label}")
+    for symbol, symbol_df in df.groupby('symbol'):
+        long_crossings[symbol] = 0
+        short_crossings[symbol] = 0
+        for i in range(20, len(symbol_df) - 1):  # Start after indicators are calculated
+            close = symbol_df['close'].iloc[i]
+            lower_band = symbol_df['lower_band'].iloc[i]
+            upper_band = symbol_df['upper_band'].iloc[i]
+            sma20 = symbol_df['sma20'].iloc[i]
+            std20 = symbol_df['std20'].iloc[i]
+            atr = symbol_df['atr'].iloc[i]
+            rsi = symbol_df['rsi'].iloc[i]
+            volume = symbol_df['volume'].iloc[i]
+            mean_vol = symbol_df['volume'].iloc[i-5:i].mean()  # 5-period mean volume
+            vol_z = (volume - mean_vol) / mean_vol if mean_vol != 0 else 0  # Volume Z-score
 
-        elif close > upper_band:
-            short_crossings += 1
-            if vol_z < -0.05:  # Short signal condition
-                entry_price = close
-                stop_loss = entry_price + 2.5 * atr
-                take_profit = entry_price - 5 * atr
-                future_prices = df['close'].iloc[i+1:]
-                hit_tp = any(future_prices <= take_profit)
-                hit_sl = any(future_prices >= stop_loss)
-                if hit_tp and (not hit_sl or future_prices[future_prices <= take_profit].index[0] < 
-                               future_prices[future_prices >= stop_loss].index[0]):
-                    label = 1  # Profitable
-                else:
-                    label = 0  # Unprofitable
-                deviation = (close - sma20) / std20
-                atr_norm = atr / close
-                signals.append([deviation, vol_z, atr_norm, rsi])
-                labels.append(label)
-                print(f"Short signal at index {i}: close={close}, upper_band={upper_band}, vol_z={vol_z}, label={label}")
+            if close < lower_band:
+                long_crossings[symbol] += 1
+                if vol_z > 0.05:  # Long signal condition
+                    entry_price = close
+                    stop_loss = entry_price - 2.5 * atr
+                    take_profit = entry_price + 5 * atr
+                    future_prices = symbol_df['close'].iloc[i+1:]
+                    hit_tp = any(future_prices >= take_profit)
+                    hit_sl = any(future_prices <= stop_loss)
+                    if hit_tp and (not hit_sl or future_prices[future_prices >= take_profit].index[0] <
+                                                    future_prices[future_prices <= stop_loss].index[0]):
+                        label = 1  # Profitable
+                    else:
+                        label = 0  # Unprofitable
+                    deviation = (close - sma20) / std20
+                    atr_norm = atr / close
+                    signals.append([deviation, vol_z, atr_norm, rsi])
+                    labels.append(label)
+                    print(f"Long signal for {symbol} at index {symbol_df.index[i]}: close={close}, lower_band={lower_band}, vol_z={vol_z}, label={label}")
 
-    print(f"Price below lower band: {long_crossings} times")
-    print(f"Price above upper band: {short_crossings} times")
+            elif close > upper_band:
+                short_crossings[symbol] += 1
+                if vol_z < -0.05:  # Short signal condition
+                    entry_price = close
+                    stop_loss = entry_price + 2.5 * atr
+                    take_profit = entry_price - 5 * atr
+                    future_prices = symbol_df['close'].iloc[i+1:]
+                    hit_tp = any(future_prices <= take_profit)
+                    hit_sl = any(future_prices >= stop_loss)
+                    if hit_tp and (not hit_sl or future_prices[future_prices <= take_profit].index[0] <
+                                                    future_prices[future_prices >= stop_loss].index[0]):
+                        label = 1  # Profitable
+                    else:
+                        label = 0  # Unprofitable
+                    deviation = (close - sma20) / std20
+                    atr_norm = atr / close
+                    signals.append([deviation, vol_z, atr_norm, rsi])
+                    labels.append(label)
+                    print(f"Short signal for {symbol} at index {symbol_df.index[i]}: close={close}, upper_band={upper_band}, vol_z={vol_z}, label={label}")
+
+        print(f"Price below lower band for {symbol}: {long_crossings[symbol]} times")
+        print(f"Price above upper band for {symbol}: {short_crossings[symbol]} times")
     print(f"Total signals generated: {len(signals)}")
     return signals, labels
 
@@ -96,7 +121,7 @@ if len(signals) == 0:
     print("No signals generated. Check signal conditions or use a larger dataset.")
 else:
     X = np.array(signals)  # Feature matrix
-    y = np.array(labels)   # Label vector
+    y = np.array(labels)  # Label vector
 
     # Split data into training and testing sets
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
